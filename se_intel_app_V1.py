@@ -60,7 +60,10 @@ def _login_screen():
             login_btn = st.form_submit_button("Login", use_container_width=True, type="primary")
 
         if login_btn:
-            users: dict = dict(st.secrets.get("users", {}))
+            try:
+                users: dict = dict(st.secrets["users"])
+            except Exception:
+                users = {}
             pw_hash = _hash(password)
             if username in users and users[username] == pw_hash:
                 st.session_state["authenticated"] = True
