@@ -65,12 +65,14 @@ def _login_screen():
             except Exception:
                 users = {}
             pw_hash = _hash(password)
+            # debug: remove after confirming login works
+            avail = list(users.keys())
             if username in users and users[username] == pw_hash:
                 st.session_state["authenticated"] = True
                 st.session_state["username"] = username
                 st.rerun()
             else:
-                st.error("❌ Invalid username or password.")
+                st.error(f"❌ Invalid username or password. Available users: {avail}")
 
     with tab_admin:
         with st.form("admin_form"):
