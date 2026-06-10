@@ -100,24 +100,45 @@ CHART_COLORS = [
 # ENGINE 1 — LOAD & ALIGN
 # ─────────────────────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False)
+def _clean_col_name(c: str) -> str:
+    """Normalise column name: strip, lowercase, remove non-breaking spaces."""
+    return c.strip().lower().replace(" ", " ").replace("  ", " ")
+
 def load_and_align(file_bytes: bytes, file_name: str) -> pd.DataFrame:
     buf = io.BytesIO(file_bytes)
     if file_name.lower().endswith(".csv"):
-        src = pd.read_csv(buf, dtype=str)
+        # Only read columns we actually need → massive memory saving on wide CSVs
+        src_raw = pd.read_csv(buf, dtype=str, nrows=0)
+        src_raw.columns = [_clean_col_name(c) for c in src_raw.columns]
+        needed = {_clean_col_name(v) for v in SOURCE_MAP.values() if v}
+        usecols_raw = [c for c in src_raw.columns if c in needed]
+        buf.seek(0)
+        src = pd.read_csv(buf, dtype=str, usecols=usecols_raw)
     else:
+        # Excel: read all, then drop unused columns immediately
         src = pd.read_excel(buf, sheet_name=0, dtype=str)
 
-    src.columns = [c.strip().lower() for c in src.columns]
+    # Normalise column names (strip, lowercase, remove  )
+    src.columns = [_clean_col_name(c) for c in src.columns]
 
+    # Keep only columns we actually need (saves memory on wide files)
+    needed_cols = {_clean_col_name(v) for v in SOURCE_MAP.values() if v}
+    drop_cols   = [c for c in src.columns if c not in needed_cols]
+    if drop_cols:
+        src.drop(columns=drop_cols, inplace=True)
+
+    # Build output dataframe using only TARGET_HEADERS
     out = {}
     for tgt in TARGET_HEADERS:
         if tgt in DERIVED:
             out[tgt] = ""
             continue
-        src_col = SOURCE_MAP.get(tgt, tgt.lower())
+        src_col = _clean_col_name(SOURCE_MAP.get(tgt, tgt.lower()))
         out[tgt] = src[src_col].values if src_col in src.columns else ""
 
     df = pd.DataFrame(out)
+    del src  # free original wide dataframe immediately
+
     ym     = df["Year-Month"].astype(str).str.strip()
     mask   = ym.str.len() >= 6
     mo_int = pd.to_numeric(ym.str[4:6], errors="coerce").fillna(0).astype(int)
@@ -133,6 +154,13 @@ def load_and_align(file_bytes: bytes, file_name: str) -> pd.DataFrame:
     for c in STR_COLS:
         if c in df.columns:
             df[c] = df[c].fillna("").astype(str).str.strip()
+
+    # Convert string columns to category to save memory (~98% reduction on large files)
+    for c in df.columns:
+        if df[c].dtype == object or str(df[c].dtype) == "string":
+            if df[c].nunique() < len(df) * 0.5:
+                df[c] = df[c].astype("category")
+
     return df
 
 def load_file_with_progress(uploaded_file):
@@ -162,8 +190,13 @@ def apply_filters(df: pd.DataFrame, fmap: dict) -> pd.DataFrame:
         if not sel:
             continue
         if col in df.columns:
-            mask &= df[col].isin(sel)
-    return df.loc[mask]
+            col_data = df[col]
+            # Handle category dtype: isin works but can be slow; cast to str first
+            if hasattr(col_data, "cat"):
+                mask &= col_data.astype(str).isin([str(s) for s in sel])
+            else:
+                mask &= col_data.isin(sel)
+    return df.loc[mask].copy()  # .copy() avoids SettingWithCopyWarning downstream
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ENGINE 3 — TABLE COMPUTATION (cached per filter state)
@@ -186,7 +219,11 @@ def df_to_bytes(df: pd.DataFrame) -> bytes:
     if df is None or df.empty:
         return b""
     buf = io.BytesIO()
-    df.to_parquet(buf, index=False)
+    # Convert category columns to string before parquet to avoid pyarrow issues
+    df_out = df.copy()
+    for c in df_out.select_dtypes(include="category").columns:
+        df_out[c] = df_out[c].astype(str)
+    df_out.to_parquet(buf, index=False)
     return buf.getvalue()
 
 def bytes_to_df(b: bytes) -> pd.DataFrame:
@@ -665,15 +702,21 @@ with st.sidebar:
 
     order_file = st.file_uploader("Order File",  type=["xlsx","xls","xlsm","csv"], key="up_order")
     if order_file:
-        df_loaded = load_file_with_progress(order_file)
-        st.session_state.order_df = df_loaded
-        st.success(f"✓ Order: {len(df_loaded):,} rows")
+        file_id = f"{order_file.name}_{order_file.size}"
+        if st.session_state.get("order_file_id") != file_id:
+            df_loaded = load_file_with_progress(order_file)
+            st.session_state.order_df      = df_loaded
+            st.session_state.order_file_id = file_id
+        st.success(f"✓ Order: {len(st.session_state.order_df):,} rows")
 
     sales_file = st.file_uploader("Sales File",  type=["xlsx","xls","xlsm","csv"], key="up_sales")
     if sales_file:
-        df_loaded = load_file_with_progress(sales_file)
-        st.session_state.sales_df = df_loaded
-        st.success(f"✓ Sales: {len(df_loaded):,} rows")
+        file_id = f"{sales_file.name}_{sales_file.size}"
+        if st.session_state.get("sales_file_id") != file_id:
+            df_loaded = load_file_with_progress(sales_file)
+            st.session_state.sales_df      = df_loaded
+            st.session_state.sales_file_id = file_id
+        st.success(f"✓ Sales: {len(st.session_state.sales_df):,} rows")
 
     st.markdown("### ⚡ Performance Source")
     avail = []
@@ -1111,24 +1154,18 @@ def render_target_tab(active_df: pd.DataFrame, fmap_no_time: dict):
         else: w_py, w_ppy = 1.0, 0.0
 
         st.markdown("##### 📦 批次套用整體成長率")
-        st.caption("設定基礎成長率後按「批次套用」，下方各 PLC 微調值將歸零（代表與整體成長率相同）。")
+        st.caption("輸入預設成長率並點擊按鈕，這會 **覆蓋** 下方所有 PLC 的獨立設定。")
         c_all1, c_all2 = st.columns([3, 1])
-        with c_all1:
-            overall_growth = st.number_input(
-                "整體成長率 % (所有 PLC 的基準)", min_value=-100, max_value=500,
-                value=int(st.session_state.get("_overall_growth", 10)),
-                step=1, key="tgt_growth"
-            )
+        with c_all1: overall_growth = st.number_input("全體 PLC 預設目標成長率 (%)", min_value=-100, max_value=500, value=10, key="tgt_growth")
         with c_all2:
             st.markdown("<br>", unsafe_allow_html=True)
             if st.button("▶ 批次套用", use_container_width=True, type="primary"):
-                st.session_state["_overall_growth"] = overall_growth
                 st.session_state["_apply_all"] = overall_growth
                 st.rerun()
 
-    df_py_all  = apply_filters(active_df, {**fmap_no_time, "Year": [py_yr]})
+    df_py_all = apply_filters(active_df, {**fmap_no_time, "Year": [py_yr]})
     df_ppy_all = apply_filters(active_df, {**fmap_no_time, "Year": [ppy_yr]})
-    df_ty_all  = apply_filters(active_df, {**fmap_no_time, "Year": [target_year]})
+    df_ty_all = apply_filters(active_df, {**fmap_no_time, "Year": [target_year]})
 
     def _plc_sum(df):
         if df.empty: return pd.Series(dtype=float)
@@ -1139,73 +1176,52 @@ def render_target_tab(active_df: pd.DataFrame, fmap_no_time: dict):
     all_plcs = [p for p in all_plcs if p]
     if not all_plcs: st.warning("找不到 PLC 相關資料。"); return
 
-    plc_py_vals  = {plc: float(py_plc.get(plc, 0))  for plc in all_plcs}
+    # 👇 修復：提前在這裡建立變數，避免 VSD 圖表抓不到資料
+    plc_py_vals = {plc: float(py_plc.get(plc, 0)) for plc in all_plcs}
     plc_ppy_vals = {plc: float(ppy_plc.get(plc, 0)) for plc in all_plcs}
-    plc_ty_vals  = {plc: float(ty_plc.get(plc, 0))  for plc in all_plcs}
+    plc_ty_vals = {plc: float(ty_plc.get(plc, 0)) for plc in all_plcs}
 
     if "_apply_all" in st.session_state:
-        st.session_state.pop("_apply_all")
+        val = st.session_state.pop("_apply_all")
         if "tgt_committed" not in st.session_state: st.session_state["tgt_committed"] = {}
-        for p in all_plcs: st.session_state["tgt_committed"][p] = 0
+        for p in all_plcs: st.session_state["tgt_committed"][p] = val
         st.rerun()
-
-    if "tgt_committed" not in st.session_state: st.session_state["tgt_committed"] = {}
-    base_growth = int(st.session_state.get("_overall_growth", overall_growth))
 
     def _base(plc):
         py_v, ppy_v = plc_py_vals.get(plc, 0), plc_ppy_vals.get(plc, 0)
-        if base_mode == "py":       return py_v
-        if base_mode == "ppy":      return ppy_v
-        if base_mode == "avg2":     return (py_v + ppy_v) / 2
+        if base_mode == "py": return py_v
+        if base_mode == "ppy": return ppy_v
+        if base_mode == "avg2": return (py_v + ppy_v) / 2
         if base_mode == "weighted": return py_v * w_py + ppy_v * w_ppy
         return py_v
 
     with setup_col:
-        st.markdown("##### 📦 每個 PLC 獨立增長率微調")
-        st.caption(
-            f"整體成長率基準 = **{base_growth}%**。"
-            "微調值為在整體成長率之上的加減（+5 代表整體+5%，-3 代表整體-3%）。"
-        )
+        st.markdown("##### 📦 每個 PLC 獨立增長率微調 (Target Setup)")
+        st.caption("調整單一 PLC 的數字並不會影響其他 PLC 的設定。")
         cols = st.columns(3)
         plc_targets = {}
-
+        if "tgt_committed" not in st.session_state: st.session_state["tgt_committed"] = {}
+            
         for i, plc in enumerate(all_plcs):
             with cols[i % 3]:
-                delta     = int(st.session_state["tgt_committed"].get(plc, 0))
-                effective = base_growth + delta
-                base_val  = _base(plc)
-                tgt_val   = base_val * (1 + effective / 100)
-
-                new_delta = st.number_input(
-                    f"{plc}  微調 ± %",
-                    min_value=-200, max_value=500,
-                    value=delta, step=1,
-                    key=f"tgt_plc_{plc}",
-                    help=f"整體 {base_growth}% + 微調 {delta:+d}% = 實際成長率 {effective}%\n"
-                         f"Base: {fmt_val(base_val)} → Target: {fmt_val(tgt_val)}"
-                )
-                st.session_state["tgt_committed"][plc] = new_delta
-                eff = base_growth + new_delta
-                plc_targets[plc] = _base(plc) * (1 + eff / 100)
+                current_val = st.session_state["tgt_committed"].get(plc, overall_growth)
+                new_val = st.number_input(f"成長率: {plc} (%)", min_value=-100, max_value=500, value=int(current_val), step=1, key=f"tgt_plc_{plc}")
+                st.session_state["tgt_committed"][plc] = new_val
+                base_val = _base(plc)
+                target_val = base_val * (1 + new_val / 100)
+                plc_targets[plc] = target_val
 
     total_target = sum(plc_targets.values())
     total_actual = float(df_ty_all["Value (EUR)"].sum()) if not df_ty_all.empty else 0.0
 
-    # PLC colour palette
-    n_plc = len(all_plcs)
-    plc_colors = (CHART_COLORS * ((n_plc // len(CHART_COLORS)) + 1))[:n_plc]
-    plc_color_map = dict(zip(all_plcs, plc_colors))
-
-    # ── 右側 VSD Chart：各 PLC 達標與剩餘 Gap ──────────────────────────────────
+    # ── 💡 需求 2：右側各 PLC 達標與剩餘 Gap 狀態圖 (VSD Widget) ────────────────
     with vsd_col:
-        st.markdown(
-            "<div style='text-align:center;font-weight:700;color:#1F3864;font-size:.85rem'>"
-            "🎯 各產品線達標與差距 (Actual vs Target)</div>", unsafe_allow_html=True
-        )
+        st.markdown("<div style='text-align: center; font-weight:700; color:#1F3864; font-size:0.85rem;'>🎯 各產品線達標與差距 (Actual vs Target)</div>", unsafe_allow_html=True)
+        
         fig_vsd = go.Figure()
         t_vals = [plc_targets.get(p, 0) for p in all_plcs]
         a_vals = [plc_ty_vals.get(p, 0) for p in all_plcs]
-
+        
         # 淺色：目標 (較寬，放在底層)
         fig_vsd.add_trace(go.Bar(
             x=all_plcs, y=t_vals, name="目標 (Target)",
@@ -1216,32 +1232,35 @@ def render_target_tab(active_df: pd.DataFrame, fmap_no_time: dict):
             x=all_plcs, y=a_vals, name="已實現 (Actual)",
             marker_color="#1F3864", width=0.4
         ))
-
+        
+        # 標籤
         annotations = []
         for i, p in enumerate(all_plcs):
-            tv = t_vals[i]; av = a_vals[i]
+            tv = t_vals[i]
+            av = a_vals[i]
             diff = av - tv
-            pct  = diff / tv if tv > 0 else 0
+            pct = (diff / tv) if tv > 0 else 0
+            
             if diff >= 0:
-                text_str  = f"超前<br>+{pct:.1%}<br>({fmt_val(diff)})"
+                text_str = f"超前<br>+{pct:.1%}<br>({fmt_val(diff)})"
                 font_color = "#375623"
             else:
-                text_str  = f"未完成<br>{pct:.1%}<br>({fmt_val(abs(diff))})"
+                text_str = f"未完成<br>{pct:.1%}<br>({fmt_val(abs(diff))})"
                 font_color = "#C55A11"
+                
             annotations.append(dict(
                 x=p, y=max(tv, av), text=text_str,
-                showarrow=False, yshift=25,
-                font=dict(size=10, color=font_color)
+                showarrow=False, yshift=25, font=dict(size=10, color=font_color)
             ))
-
+            
         fig_vsd.update_layout(
             barmode="overlay", showlegend=True, height=300,
             legend=dict(orientation="h", y=-0.3),
-            margin=dict(t=40, b=10, l=10, r=10),
-            font=dict(family="IBM Plex Sans"),
+            margin=dict(t=40, b=10, l=10, r=10), font=dict(family="IBM Plex Sans"),
             annotations=annotations
         )
         st.plotly_chart(fig_vsd, use_container_width=True)
+
     st.markdown("---"); st.markdown("### 📊 全局預測模型與業績進度圖")
     
     # ── 💡 需求 1：雙預測模型選項切換與月度 Faded 疊加圖 ──────────────────────
@@ -1256,169 +1275,96 @@ def render_target_tab(active_df: pd.DataFrame, fmap_no_time: dict):
     months_labels = [month_names[m] for m in range(1, 13)]
     
     if "Historical" in proj_mode:
-        # 歷史趨勢權重：各年度先正規化為月份佔比，再依 base_mode 加權平均
-        def _mo_weights(df):
-            agg = df.groupby("Month")["Value (EUR)"].sum()
-            total = sum(float(agg.get(m, 0)) for m in months_keys)
-            if total <= 0:
-                return {m: 1/12 for m in months_keys}
-            return {m: float(agg.get(m, 0)) / total for m in months_keys}
-
-        w_py_mo  = _mo_weights(df_py_all)
-        w_ppy_mo = _mo_weights(df_ppy_all)
-
-        if base_mode == "py":
-            month_weights = w_py_mo
-        elif base_mode == "ppy":
-            month_weights = w_ppy_mo
-        elif base_mode == "avg2":
-            month_weights = {m: (w_py_mo[m] + w_ppy_mo[m]) / 2 for m in months_keys}
-        else:  # weighted
-            month_weights = {m: w_py_mo[m] * w_py + w_ppy_mo[m] * w_ppy for m in months_keys}
-            # re-normalise in case weights don't sum to 1
-            wt_sum = sum(month_weights.values())
-            if wt_sum > 0:
-                month_weights = {m: v / wt_sum for m, v in month_weights.items()}
+        # 抓取過去兩年的月度權重進行加總混合
+        df_py_monthly = df_py_all.groupby("Month")["Value (EUR)"].sum()
+        df_ppy_monthly = df_ppy_all.groupby("Month")["Value (EUR)"].sum()
+        combined_past = pd.Series(0.0, index=months_keys)
+        for m in months_keys:
+            combined_past[m] = float(df_py_monthly.get(m, 0.0)) + float(df_ppy_monthly.get(m, 0.0))
+        past_total = combined_past.sum()
+        month_weights = {m: combined_past[m] / past_total for m in months_keys} if past_total > 0 else {m: 1/12 for m in months_keys}
     else:
         # 線性預測：12個月均分
         month_weights = {m: 1/12 for m in months_keys}
 
-    # 各月原始目標（全年均分或歷史加權）
+    # 計算各月目標與累計目標
     monthly_targets = [total_target * month_weights[str(m)] for m in range(1, 13)]
+    cum_targets = pd.Series(monthly_targets).cumsum().tolist()
 
-    # 純目標累計線（不考慮實際，僅供參考）
-    cum_targets = list(pd.Series(monthly_targets).cumsum())
-
-    # 實際月度與累計
+    # 計算各月實際營收與累計營收
     df_ty_monthly = df_ty_all.groupby("Month")["Value (EUR)"].sum()
     max_actual_month = int(df_ty_all["Month"].replace("", "0").astype(int).max()) if not df_ty_all.empty else 0
-    actual_vals = [float(df_ty_monthly.get(str(m), 0)) for m in range(1, 13)]
-    cum_actuals = list(pd.Series(actual_vals[:max_actual_month]).cumsum())
+    actual_vals = [df_ty_monthly.get(str(m), 0) for m in range(1, 13)]
+    cum_actuals = pd.Series(actual_vals[:max_actual_month]).cumsum().tolist()
 
-    # ── 調整後預測曲線 ────────────────────────────────────────────────────────
-    # 邏輯：已完成月份 → 使用實際累計
-    #       未完成月份 → 剩餘目標（total_target - 已完成實際）÷ 剩餘月份 線性分配
-    #       保留歷史趨勢模式時，未完成月份按各月原始權重比例分配剩餘目標
-    actual_ytd   = cum_actuals[-1] if cum_actuals else 0.0
-    remaining_tgt = total_target - actual_ytd
-    remaining_mo  = 12 - max_actual_month
-
-    if remaining_mo > 0:
-        if "Historical" in proj_mode:
-            # 剩餘月份按歷史比例重新分配
-            future_weights_raw = {str(m): month_weights[str(m)] for m in range(max_actual_month+1, 13)}
-            fw_sum = sum(future_weights_raw.values())
-            if fw_sum > 0:
-                adj_monthly = {m: remaining_tgt * v / fw_sum for m, v in future_weights_raw.items()}
-            else:
-                adj_monthly = {str(m): remaining_tgt / remaining_mo for m in range(max_actual_month+1, 13)}
-        else:
-            adj_monthly = {str(m): remaining_tgt / remaining_mo for m in range(max_actual_month+1, 13)}
-    else:
-        adj_monthly = {}
-
-    # Build projected cumulative series
-    projected_cum = []
+    # 💡 需求 3: 計算未來的預期成長曲線 (將已完成疊加上去)
+    projected_vals = []
+    current_cum = cum_actuals[-1] if cum_actuals else 0
     for m in range(1, 13):
         if m <= max_actual_month:
-            projected_cum.append(cum_actuals[m-1])
+            projected_vals.append(cum_actuals[m-1])
         else:
-            prev = projected_cum[-1] if projected_cum else actual_ytd
-            projected_cum.append(prev + adj_monthly.get(str(m), 0))
+            current_cum += monthly_targets[m-1]
+            projected_vals.append(current_cum)
 
-    # Also build adjusted monthly bar values (for chart A)
-    adj_monthly_bars = []
-    for m in range(1, 13):
-        if m <= max_actual_month:
-            adj_monthly_bars.append(monthly_targets[m-1])  # original for reference
-        else:
-            adj_monthly_bars.append(adj_monthly.get(str(m), 0))
-
-    # ── Chart A: 月度疊加圖 (目標 vs 實際) + 調整後月度目標 ────────────────────
+    # 渲染 A 圖表：月度直接進度疊加圖 (💡 需求 1: 淺色疊加量長條圖)
     col_ch1, col_ch2 = st.columns(2)
     with col_ch1:
         st.markdown("#### 🌊 A. 月度疊加比較圖")
-        st.caption("淺色 = 月度目標，深色疊加 = 實際達成；橙線 = 調整後月度目標（依剩餘業績重新分配）。")
+        st.caption("淺色長條為目標，深色長條疊加在前方為實際達成，直觀看出該月 Gap。")
         fig_monthly_overlay = go.Figure()
+        # 淺色：月度預期目標 (Target Base)
         fig_monthly_overlay.add_trace(go.Bar(
-            x=months_labels, y=monthly_targets, name="原始月度目標",
+            x=months_labels, y=monthly_targets, name="預期目標 Target",
             marker_color="#BDD7EE", opacity=0.5, offsetgroup=0
         ))
+        # 深色：月度實際達成 (Actual Achieved) — 內嵌疊加
         fig_monthly_overlay.add_trace(go.Bar(
-            x=months_labels[:max_actual_month],
-            y=actual_vals[:max_actual_month],
-            name="實際達成 Actual",
+            x=months_labels[:max_actual_month], y=actual_vals[:max_actual_month], name="實際達成 Actual",
             marker_color="#1F3864", opacity=0.9, offsetgroup=0
         ))
-        # Adjusted target line overlay
-        fig_monthly_overlay.add_trace(go.Scatter(
-            x=months_labels, y=adj_monthly_bars,
-            name="調整後月度目標", mode="lines+markers",
-            line=dict(color="#C55A11", width=2, dash="dot"),
-            marker=dict(size=5),
-        ))
         fig_monthly_overlay.update_layout(
-            barmode="overlay", height=420, font=dict(family="IBM Plex Sans"),
-            title="月度目標 vs 實際（含調整後目標線）",
-            title_font=dict(size=12, color="#1F3864"),
-            legend=dict(orientation="h", y=-0.25), yaxis_title="Value (EUR)"
+            barmode="overlay", height=420, font=dict(family="IBM Plex Sans"), 
+            legend=dict(orientation="h", y=-0.2), yaxis_title="Value (EUR)"
         )
         st.plotly_chart(fig_monthly_overlay, use_container_width=True)
 
-    # ── Chart B: 累計折線 + 長條圖 ───────────────────────────────────────────
+    # 渲染 B 圖表：累計值走勢圖 (Cumulative Value Trends)
     with col_ch2:
         st.markdown("#### 📈 B. 累計業績 — 實際 vs 預期成長曲線")
-        st.caption(
-            "長條 = 累計實際（已完成）/ 預測（未來）。"
-            "橙虛線 = 純線性/歷史目標累計。藍實線 = 調整後預測曲線（考慮已完成業績重新分配剩餘目標）。"
-        )
+        st.caption("將當前已達成的業績，疊加上未來的預期目標，形成最終的預期成長曲線。")
         fig_cum = go.Figure()
-
-        # 已完成月份：深色長條
-        if cum_actuals:
-            fig_cum.add_trace(go.Bar(
-                x=months_labels[:max_actual_month], y=cum_actuals,
-                name="累計實際 Actual", marker_color="#1F3864", opacity=0.9
-            ))
-
-        # 未來月份：淺色長條（調整後累計）
-        if max_actual_month < 12:
-            fig_cum.add_trace(go.Bar(
-                x=months_labels[max_actual_month:],
-                y=projected_cum[max_actual_month:],
-                name="預測累計 Forecast", marker_color="#BDD7EE", opacity=0.65
-            ))
-
-        # 純原始目標線（虛線參考）
+        
+        # 原始純目標線 (純參考)
         fig_cum.add_trace(go.Scatter(
-            x=months_labels, y=cum_targets, name="原始目標累計線",
+            x=months_labels, y=cum_targets, name="原始純目標線", 
             mode="lines", line=dict(color="#C55A11", width=2, dash="dash")
         ))
+        
+        # 已實現的柱狀圖
+        if cum_actuals:
+            fig_cum.add_trace(go.Bar(
+                x=months_labels[:max_actual_month], y=cum_actuals, 
+                name="今年累計實際", marker_color="#1F3864"
+            ))
+            
+        # 未來的預期疊加柱狀圖
+        if max_actual_month < 12:
+            fig_cum.add_trace(go.Bar(
+                x=months_labels[max_actual_month:], y=projected_vals[max_actual_month:], 
+                name="未來預期疊加累計", marker_color="#BDD7EE", opacity=0.6
+            ))
 
-        # 調整後預測曲線（從最後一個實際月份延伸）
+        # 預期成長曲線 (實線)
         connect_idx = max(0, max_actual_month - 1)
         fig_cum.add_trace(go.Scatter(
-            x=months_labels[connect_idx:], y=projected_cum[connect_idx:],
-            name="調整後預測曲線", mode="lines+markers",
-            line=dict(color="#2E75B6", width=3), marker=dict(size=7)
+            x=months_labels[connect_idx:], y=projected_vals[connect_idx:], 
+            name="預測成長曲線 (Projected)", mode="lines+markers", 
+            line=dict(color="#2E75B6", width=3), marker=dict(size=8)
         ))
 
-        # Mark boundary actual / forecast
-        if 0 < max_actual_month < 12:
-            fig_cum.add_vrect(
-                x0=months_labels[max_actual_month-1],
-                x1=months_labels[max_actual_month],
-                fillcolor="gray", opacity=0.07, line_width=0,
-                annotation_text="← 實際 | 預測 →",
-                annotation_position="top left",
-                annotation_font_size=10,
-            )
-
         fig_cum.update_layout(
-            height=420, font=dict(family="IBM Plex Sans"),
-            title="累計業績 — 實際 vs 調整後預測曲線",
-            title_font=dict(size=12, color="#1F3864"),
-            legend=dict(orientation="h", y=-0.25),
+            height=420, font=dict(family="IBM Plex Sans"), legend=dict(orientation="h", y=-0.2), 
             yaxis_title="Cumulative Value (EUR)", barmode="group"
         )
         st.plotly_chart(fig_cum, use_container_width=True)
@@ -1482,5 +1428,4 @@ st.markdown("---")
 
 with st.expander("📋 Raw Data Preview (filtered)", expanded=False):
     st.dataframe(df_curr[TARGET_HEADERS].head(2000), use_container_width=True, hide_index=True, height=400)
-    st.caption(f"Showing first 2,000 of {len(df_curr):,} filtered rows.")
     st.caption(f"Showing first 2,000 of {len(df_curr):,} filtered rows.")
