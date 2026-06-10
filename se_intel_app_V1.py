@@ -5,6 +5,7 @@ python -m streamlit run se_intel_app.py
 """
 
 import io
+import hashlib
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -17,6 +18,74 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ACCESS CONTROL
+# ─────────────────────────────────────────────────────────────────────────────
+def _hash(s: str) -> str:
+    return hashlib.sha256(s.encode()).hexdigest()
+
+def _check_launch_key() -> bool:
+    try:
+        stored = st.secrets["auth"]["launch_key"]
+        return bool(stored)
+    except Exception:
+        st.error("⛔ Launch key not found. Please create `.streamlit/secrets.toml`.")
+        st.code("""[auth]\nlaunch_key = "YOUR_KEY"\nadmin_key = "YOUR_ADMIN_KEY"\n\n[users]\nusername = "sha256_hash"
+""", language="toml")
+        st.stop()
+
+def _login_screen():
+    st.markdown("""
+    <div style='max-width:400px;margin:80px auto 0;padding:2rem 2.5rem;
+    background:white;border-radius:12px;box-shadow:0 4px 24px rgba(31,56,100,.12);'>
+    <h2 style='color:#1F3864;margin-bottom:1.5rem;text-align:center;font-size:1.4rem'>
+    🔐 SE Intel Dashboard</h2>
+    </div>
+    """, unsafe_allow_html=True)
+
+    tab_user, tab_admin = st.tabs(["👤 User Login", "🔑 Admin"])
+
+    with tab_user:
+        with st.form("login_form"):
+            username  = st.text_input("Username", placeholder="Enter your username")
+            password  = st.text_input("Password", type="password", placeholder="Enter your password")
+            login_btn = st.form_submit_button("Login", use_container_width=True, type="primary")
+        if login_btn:
+            try:
+                users = dict(st.secrets["users"])
+            except Exception:
+                users = {}
+            if username in users and users[username] == _hash(password):
+                st.session_state["authenticated"] = True
+                st.session_state["username"] = username
+                st.rerun()
+            else:
+                st.error(f"❌ Invalid username or password. Available users: {list(users.keys())}")
+
+    with tab_admin:
+        with st.form("admin_form"):
+            admin_input = st.text_input("Admin Key", type="password", placeholder="Enter admin key")
+            admin_btn   = st.form_submit_button("Enter", use_container_width=True, type="primary")
+        if admin_btn:
+            try:
+                admin_key_stored = st.secrets["auth"].get("admin_key", "")
+                if admin_key_stored and admin_input == admin_key_stored:
+                    st.session_state["authenticated"] = True
+                    st.session_state["username"] = "Admin"
+                    st.rerun()
+                else:
+                    st.error("❌ Invalid admin key.")
+            except Exception:
+                st.error("❌ Admin key not configured.")
+
+def _check_auth():
+    _check_launch_key()
+    if not st.session_state.get("authenticated", False):
+        _login_screen()
+        st.stop()
+
+_check_auth()
 
 st.markdown("""
 <style>
@@ -686,6 +755,12 @@ for k, v in defaults.items():
 # ─────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("# 📊 SE Intel")
+    uname = st.session_state.get("username", "")
+    st.caption(f"👤 Logged in as **{uname}**")
+    if st.button("🚪 Logout", use_container_width=True):
+        st.session_state["authenticated"] = False
+        st.session_state["username"] = ""
+        st.rerun()
     st.markdown("---")
     st.markdown("### 📁 Data Sources")
 
