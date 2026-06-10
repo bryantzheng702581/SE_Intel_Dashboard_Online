@@ -100,44 +100,37 @@ CHART_COLORS = [
 # ENGINE 1 — LOAD & ALIGN
 # ─────────────────────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False)
-def _clean_col_name(c: str) -> str:
-    """Normalise column name: strip, lowercase, remove non-breaking spaces."""
+def _clean_col(c: str) -> str:
+    """Strip, lowercase, remove non-breaking spaces from column names."""
     return c.strip().lower().replace(" ", " ").replace("  ", " ")
 
+@st.cache_data(show_spinner=False)
 def load_and_align(file_bytes: bytes, file_name: str) -> pd.DataFrame:
     buf = io.BytesIO(file_bytes)
     if file_name.lower().endswith(".csv"):
-        # Only read columns we actually need → massive memory saving on wide CSVs
-        src_raw = pd.read_csv(buf, dtype=str, nrows=0)
-        src_raw.columns = [_clean_col_name(c) for c in src_raw.columns]
-        needed = {_clean_col_name(v) for v in SOURCE_MAP.values() if v}
-        usecols_raw = [c for c in src_raw.columns if c in needed]
-        buf.seek(0)
-        src = pd.read_csv(buf, dtype=str, usecols=usecols_raw)
+        src = pd.read_csv(buf, dtype=str)
     else:
-        # Excel: read all, then drop unused columns immediately
         src = pd.read_excel(buf, sheet_name=0, dtype=str)
 
-    # Normalise column names (strip, lowercase, remove  )
-    src.columns = [_clean_col_name(c) for c in src.columns]
+    # Normalise column names including   non-breaking spaces
+    src.columns = [_clean_col(c) for c in src.columns]
 
-    # Keep only columns we actually need (saves memory on wide files)
-    needed_cols = {_clean_col_name(v) for v in SOURCE_MAP.values() if v}
+    # Drop columns we don't need → massive memory reduction on wide files
+    needed_cols = {_clean_col(v) for v in SOURCE_MAP.values() if v}
     drop_cols   = [c for c in src.columns if c not in needed_cols]
     if drop_cols:
         src.drop(columns=drop_cols, inplace=True)
 
-    # Build output dataframe using only TARGET_HEADERS
     out = {}
     for tgt in TARGET_HEADERS:
         if tgt in DERIVED:
             out[tgt] = ""
             continue
-        src_col = _clean_col_name(SOURCE_MAP.get(tgt, tgt.lower()))
+        src_col = _clean_col(SOURCE_MAP.get(tgt, tgt.lower()))
         out[tgt] = src[src_col].values if src_col in src.columns else ""
 
     df = pd.DataFrame(out)
-    del src  # free original wide dataframe immediately
+    del src  # free wide dataframe immediately
 
     ym     = df["Year-Month"].astype(str).str.strip()
     mask   = ym.str.len() >= 6
@@ -155,9 +148,9 @@ def load_and_align(file_bytes: bytes, file_name: str) -> pd.DataFrame:
         if c in df.columns:
             df[c] = df[c].fillna("").astype(str).str.strip()
 
-    # Convert string columns to category to save memory (~98% reduction on large files)
+    # Convert string columns to category — reduces memory by ~95%
     for c in df.columns:
-        if df[c].dtype == object or str(df[c].dtype) == "string":
+        if df[c].dtype == object:
             if df[c].nunique() < len(df) * 0.5:
                 df[c] = df[c].astype("category")
 
@@ -190,13 +183,9 @@ def apply_filters(df: pd.DataFrame, fmap: dict) -> pd.DataFrame:
         if not sel:
             continue
         if col in df.columns:
-            col_data = df[col]
-            # Handle category dtype: isin works but can be slow; cast to str first
-            if hasattr(col_data, "cat"):
-                mask &= col_data.astype(str).isin([str(s) for s in sel])
-            else:
-                mask &= col_data.isin(sel)
-    return df.loc[mask].copy()  # .copy() avoids SettingWithCopyWarning downstream
+            col_s = df[col].astype(str) if hasattr(df[col], "cat") else df[col]
+            mask &= col_s.isin([str(s) for s in sel])
+    return df.loc[mask].copy()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ENGINE 3 — TABLE COMPUTATION (cached per filter state)
@@ -219,8 +208,8 @@ def df_to_bytes(df: pd.DataFrame) -> bytes:
     if df is None or df.empty:
         return b""
     buf = io.BytesIO()
-    # Convert category columns to string before parquet to avoid pyarrow issues
     df_out = df.copy()
+    # Convert category → str before parquet to avoid pyarrow serialisation errors
     for c in df_out.select_dtypes(include="category").columns:
         df_out[c] = df_out[c].astype(str)
     df_out.to_parquet(buf, index=False)
@@ -702,20 +691,20 @@ with st.sidebar:
 
     order_file = st.file_uploader("Order File",  type=["xlsx","xls","xlsm","csv"], key="up_order")
     if order_file:
-        file_id = f"{order_file.name}_{order_file.size}"
-        if st.session_state.get("order_file_id") != file_id:
+        fid = f"{order_file.name}_{order_file.size}"
+        if st.session_state.get("order_file_id") != fid:
             df_loaded = load_file_with_progress(order_file)
             st.session_state.order_df      = df_loaded
-            st.session_state.order_file_id = file_id
+            st.session_state.order_file_id = fid
         st.success(f"✓ Order: {len(st.session_state.order_df):,} rows")
 
     sales_file = st.file_uploader("Sales File",  type=["xlsx","xls","xlsm","csv"], key="up_sales")
     if sales_file:
-        file_id = f"{sales_file.name}_{sales_file.size}"
-        if st.session_state.get("sales_file_id") != file_id:
+        fid = f"{sales_file.name}_{sales_file.size}"
+        if st.session_state.get("sales_file_id") != fid:
             df_loaded = load_file_with_progress(sales_file)
             st.session_state.sales_df      = df_loaded
-            st.session_state.sales_file_id = file_id
+            st.session_state.sales_file_id = fid
         st.success(f"✓ Sales: {len(st.session_state.sales_df):,} rows")
 
     st.markdown("### ⚡ Performance Source")
