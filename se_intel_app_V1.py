@@ -1004,12 +1004,21 @@ if tables is None:
     st.stop()
 
 # ── Summary metrics — Row 1 (基礎運作規模，無 Delta) ─────────────────────────
-mc1 = st.columns(5)
+mc1 = st.columns(6)
 mc1[0].metric("Total Value (EUR)", fmt_val(g_total))
 mc1[1].metric("# Transactions",         f"{len(df_curr):,}")
 mc1[2].metric("# Countries",            df_curr["Country"].nunique())
 mc1[3].metric("# Product Line Codes",   df_curr["PLC"].nunique())
 mc1[4].metric("# Comm Refs",            df_curr["Commercial Reference"].nunique())
+try:
+    import psutil, os
+    mem_mb = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
+    mc1[5].metric("🧠 Memory",
+                  f"{mem_mb:.0f} MB",
+                  delta=f"{mem_mb - 1024:.0f} MB vs 1GB limit" if mem_mb > 700 else "✅ OK",
+                  delta_color="inverse" if mem_mb > 700 else "normal")
+except Exception:
+    mc1[5].metric("🧠 Memory", "N/A")
 
 # ── Summary metrics — Row 2 (💡 需求 3：全新獨立增長率大字卡矩陣列) ───────────
 st.markdown("<div style='margin-top: -10px;'></div>", unsafe_allow_html=True)
