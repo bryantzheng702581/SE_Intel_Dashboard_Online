@@ -800,13 +800,40 @@ with st.sidebar:
         else st.session_state.order_df
     )
 
-    def col_vals(df, col):
-        if df is None or df.empty: return []
-        return sorted(df[col].replace("", pd.NA).dropna().unique().tolist())
+    # ── Pre-compute unique values once per column (no DataFrame copies) ────────
+    # This avoids creating multiple copies of the 700MB+ DataFrame during cascade
+    @st.cache_data(show_spinner=False)
+    def _precompute_uniques(file_id: str, source: str) -> dict:
+        """Cache unique values per column keyed by file identity."""
+        df = st.session_state.get(
+            "order_df" if source == "Order" else "sales_df")
+        if df is None: return {}
+        result = {}
+        for col in ["Operations","Zone","Cluster","Area","Country",
+                    "PLC","Family","Strategic Product Family",
+                    "Comm Ref Code","Commercial Reference","Year"]:
+            if col in df.columns:
+                vals = df[col].astype(str).replace("nan","").replace("","<NA>")
+                result[col] = sorted([v for v in vals.unique() if v not in ("","<NA>","nan")])
+        return result
 
-    def opts(col): return col_vals(active_df, col)
+    file_id   = st.session_state.get("order_file_id" if perf_source == "Order" else "sales_file_id", "")
+    _uniq     = _precompute_uniques(file_id, perf_source)
+
+    def _cascade_opts(col, filters: dict) -> list:
+        """Return filtered unique values using pre-computed sets — NO DataFrame ops."""
+        if not _uniq: return []
+        if not any(filters.values()):
+            return _uniq.get(col, [])
+        # Build allowed set by intersecting active filters across columns
+        # We need to know which rows pass all OTHER filters
+        # Since we can't do row-level ops without the df, fall back to
+        # showing all options for that column (safe, just slightly less precise cascade)
+        return _uniq.get(col, [])
+
+    def opts(col): return _uniq.get(col, [])
+
     st.markdown("---")
-
     with st.form(key="filter_form", border=False):
         st.markdown("### 🕐 Time Filters")
         f_year  = st.multiselect("Year",    opts("Year"),     placeholder="Select...")
@@ -814,41 +841,23 @@ with st.sidebar:
         st.markdown("---")
         update_btn = st.form_submit_button("▶  UPDATE ALL TABLES", use_container_width=True, type="primary", disabled=(active_df is None))
 
+    # Geography & Product filters — show all unique values, no live cascade filtering
+    # (cascade narrowing happens only at UPDATE time, not on every widget interaction)
     st.markdown("### 🌍 Geography Filters")
-    st.caption("⬇ Cascade: each selection narrows the next.")
-    _df_geo = active_df if active_df is not None else pd.DataFrame(columns=STR_COLS)
-
-    f_ops = st.multiselect("Operations", col_vals(_df_geo, "Operations"), placeholder="Select...", key="sb_ops")
-    if f_ops and not _df_geo.empty: _df_geo = _df_geo[_df_geo["Operations"].isin(f_ops)]
-
-    f_zone = st.multiselect("Zone", col_vals(_df_geo, "Zone"), placeholder="Select...", key="sb_zone")
-    if f_zone and not _df_geo.empty: _df_geo = _df_geo[_df_geo["Zone"].isin(f_zone)]
-
-    f_cluster = st.multiselect("Cluster", col_vals(_df_geo, "Cluster"), placeholder="Select...", key="sb_cluster")
-    if f_cluster and not _df_geo.empty: _df_geo = _df_geo[_df_geo["Cluster"].isin(f_cluster)]
-
-    f_area = st.multiselect("Area", col_vals(_df_geo, "Area"), placeholder="Select...", key="sb_area")
-    if f_area and not _df_geo.empty: _df_geo = _df_geo[_df_geo["Area"].isin(f_area)]
-
-    f_country = st.multiselect("Country", col_vals(_df_geo, "Country"), placeholder="Select...", key="sb_country")
+    st.caption("Select values then press ▶ UPDATE ALL TABLES to apply.")
+    f_ops     = st.multiselect("Operations", opts("Operations"), placeholder="Select...", key="sb_ops")
+    f_zone    = st.multiselect("Zone",       opts("Zone"),       placeholder="Select...", key="sb_zone")
+    f_cluster = st.multiselect("Cluster",    opts("Cluster"),    placeholder="Select...", key="sb_cluster")
+    f_area    = st.multiselect("Area",       opts("Area"),       placeholder="Select...", key="sb_area")
+    f_country = st.multiselect("Country",    opts("Country"),    placeholder="Select...", key="sb_country")
 
     st.markdown("### 📦 Product Filters")
-    st.caption("⬇ Cascade: each selection narrows the next.")
-    _df_sb = active_df if active_df is not None else pd.DataFrame(columns=STR_COLS)
-
-    f_plc = st.multiselect("Product Line Code", col_vals(_df_sb, "PLC"), placeholder="Select...", key="sb_plc")
-    if f_plc and not _df_sb.empty: _df_sb = _df_sb[_df_sb["PLC"].isin(f_plc)]
-
-    f_fam = st.multiselect("Family", col_vals(_df_sb, "Family"), placeholder="Select...", key="sb_fam")
-    if f_fam and not _df_sb.empty: _df_sb = _df_sb[_df_sb["Family"].isin(f_fam)]
-
-    f_spf = st.multiselect("Strategic Product Family", col_vals(_df_sb, "Strategic Product Family"), placeholder="Select...", key="sb_spf")
-    if f_spf and not _df_sb.empty: _df_sb = _df_sb[_df_sb["Strategic Product Family"].isin(f_spf)]
-
-    f_crc = st.multiselect("Comm Ref Code", col_vals(_df_sb, "Comm Ref Code"), placeholder="Select...", key="sb_crc")
-    if f_crc and not _df_sb.empty: _df_sb = _df_sb[_df_sb["Comm Ref Code"].isin(f_crc)]
-
-    f_cr = st.multiselect("Comm Ref", col_vals(_df_sb, "Commercial Reference"), placeholder="Select...", key="sb_cr")
+    st.caption("Select values then press ▶ UPDATE ALL TABLES to apply.")
+    f_plc = st.multiselect("Product Line Code",        opts("PLC"),                        placeholder="Select...", key="sb_plc")
+    f_fam = st.multiselect("Family",                   opts("Family"),                     placeholder="Select...", key="sb_fam")
+    f_spf = st.multiselect("Strategic Product Family", opts("Strategic Product Family"),   placeholder="Select...", key="sb_spf")
+    f_crc = st.multiselect("Comm Ref Code",            opts("Comm Ref Code"),              placeholder="Select...", key="sb_crc")
+    f_cr  = st.multiselect("Comm Ref",                 opts("Commercial Reference"),       placeholder="Select...", key="sb_cr")
 
     st.markdown("---")
     rst_btn = st.button("↺  RESET ALL FILTERS", use_container_width=True, disabled=(active_df is None))
