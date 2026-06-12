@@ -173,23 +173,22 @@ def _clean_col(c: str) -> str:
     """Strip, lowercase, remove non-breaking spaces from column names."""
     return c.strip().lower().replace(" ", " ").replace("  ", " ")
 
-@st.cache_data(show_spinner=False)
+def _clean_col(c: str) -> str:
+    return c.strip().lower().replace("\xa0", " ").replace("  ", " ")
+
 def load_and_align(file_bytes: bytes, file_name: str) -> pd.DataFrame:
+    """No @st.cache_data — caller stores in session_state once, avoids double-copy."""
+    import gc
     buf = io.BytesIO(file_bytes)
     if file_name.lower().endswith(".csv"):
         src = pd.read_csv(buf, dtype=str)
     else:
         src = pd.read_excel(buf, sheet_name=0, dtype=str)
-
-    # Normalise column names including   non-breaking spaces
     src.columns = [_clean_col(c) for c in src.columns]
-
-    # Drop columns we don't need → massive memory reduction on wide files
     needed_cols = {_clean_col(v) for v in SOURCE_MAP.values() if v}
     drop_cols   = [c for c in src.columns if c not in needed_cols]
     if drop_cols:
         src.drop(columns=drop_cols, inplace=True)
-
     out = {}
     for tgt in TARGET_HEADERS:
         if tgt in DERIVED:
@@ -197,64 +196,59 @@ def load_and_align(file_bytes: bytes, file_name: str) -> pd.DataFrame:
             continue
         src_col = _clean_col(SOURCE_MAP.get(tgt, tgt.lower()))
         out[tgt] = src[src_col].values if src_col in src.columns else ""
-
     df = pd.DataFrame(out)
-    del src  # free wide dataframe immediately
-
+    del src; gc.collect()
     ym     = df["Year-Month"].astype(str).str.strip()
     mask   = ym.str.len() >= 6
     mo_int = pd.to_numeric(ym.str[4:6], errors="coerce").fillna(0).astype(int)
-
     df["Year"]    = ym.str[:4].where(mask, "")
     df["Month"]   = mo_int.astype(str).where(mask, "")
     df["Quarter"] = ((mo_int - 1) // 3 + 1).astype(str).where(mask, "")
     df["Half"]    = mo_int.apply(lambda m: "1" if 1 <= m <= 6 else ("2" if m > 6 else "")).where(mask, "")
-
     df["Value (EUR)"] = pd.to_numeric(df["Value (EUR)"], errors="coerce").fillna(0.0)
     df["Quantity"]    = pd.to_numeric(df["Quantity"],    errors="coerce").fillna(0.0)
-
     for c in STR_COLS:
         if c in df.columns:
             df[c] = df[c].fillna("").astype(str).str.strip()
-
-    # Convert string columns to category — reduces memory by ~95%
     for c in df.columns:
-        if df[c].dtype == object:
-            if df[c].nunique() < len(df) * 0.5:
-                df[c] = df[c].astype("category")
-
+        if df[c].dtype == object and df[c].nunique() < len(df) * 0.5:
+            df[c] = df[c].astype("category")
+    gc.collect()
     return df
 
 def load_file_with_progress(uploaded_file):
-    bar_area  = st.empty()
-    info_area = st.empty()
+    import gc, time
+    bar_area = st.empty(); info_area = st.empty()
     with bar_area.container():
         bar = st.progress(0, text="📂 Reading file…")
     raw_bytes = uploaded_file.read()
     bar.progress(25, text="📂 File received, parsing columns…")
     info_area.caption(f"Processing **{uploaded_file.name}** ({len(raw_bytes)/1024/1024:.1f} MB)…")
     df = load_and_align(raw_bytes, uploaded_file.name)
-    bar.progress(70, text="🔧 Deriving Year / Month / Quarter / Half…")
-    _ = [df[c].unique() for c in STR_COLS if c in df.columns]
+    del raw_bytes; gc.collect()
     bar.progress(95, text="✅ Finalising…")
     bar.progress(100, text=f"✅ Done — {len(df):,} rows loaded")
-    import time; time.sleep(0.4)
-    bar_area.empty()
-    info_area.empty()
+    time.sleep(0.4)
+    bar_area.empty(); info_area.empty()
     return df
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ENGINE 2 — FAST VECTORISED FILTER
+# ENGINE 2 — FILTER
 # ─────────────────────────────────────────────────────────────────────────────
 def apply_filters(df: pd.DataFrame, fmap: dict) -> pd.DataFrame:
-    mask = pd.Series(True, index=df.index)
+    if df is None or df.empty:
+        return pd.DataFrame()
+    mask = None
     for col, sel in fmap.items():
-        if not sel:
+        if not sel or col not in df.columns:
             continue
-        if col in df.columns:
-            col_s = df[col].astype(str) if hasattr(df[col], "cat") else df[col]
-            mask &= col_s.isin([str(s) for s in sel])
-    return df.loc[mask]  # view, no copy — saves memory
+        sel_set = {str(s) for s in sel}
+        col_data = df[col]
+        col_mask = col_data.astype(str).isin(sel_set) if hasattr(col_data, "cat") else col_data.isin(sel_set)
+        mask = col_mask if mask is None else (mask & col_mask)
+    if mask is None:
+        return df
+    return df.loc[mask]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ENGINE 3 — TABLE COMPUTATION (cached per filter state)
