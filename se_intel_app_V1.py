@@ -596,16 +596,30 @@ def render_price_tab(df_curr: pd.DataFrame, fmap: dict):
     annual_price_df  = compute_price_analysis_direct(df_base, tuple(all_cr_in_scope))
     monthly_price_df = compute_price_monthly_direct(df_base, tuple(all_cr_in_scope))
 
-    fam_selected, spf_selected = pc["fam"], pc["spf"]
-    if fam_selected and not spf_selected: group_dim, group_vals = "Family", fam_selected
+    # ── Sub-Product Selector: derive group from filter selection ────────────────
+    # If Comm Refs are selected, auto-detect their Family for Sub-Product Selector
+    fam_selected = pc["fam"]
+    spf_selected = pc["spf"]
+    cr_selected  = pc["cr"]
+
+    # If CR selected, derive Family from those CRs in df_base
+    if cr_selected and not fam_selected:
+        fam_from_cr = df_base[df_base["Commercial Reference"].isin(cr_selected)]["Family"].replace("", pd.NA).dropna().unique().tolist()
+        fam_selected = sorted(fam_from_cr) if fam_from_cr else fam_selected
+
+    if fam_selected and not spf_selected:   group_dim, group_vals = "Family", fam_selected
     elif spf_selected and not fam_selected: group_dim, group_vals = "Strategic Product Family", spf_selected
-    elif fam_selected and spf_selected: group_dim, group_vals = "Family", fam_selected
+    elif fam_selected and spf_selected:     group_dim, group_vals = "Family", fam_selected
     else: group_dim, group_vals = "Family", sorted(df_base["Family"].replace("", pd.NA).dropna().unique().tolist())
 
     st.markdown("---"); section("🗂 Sub-Product Selector")
-    if len(group_vals) > 1: focus_group = st.selectbox(f"Select {group_dim} to explore", group_vals, key="pr_focus_group")
-    else: focus_group = group_vals[0] if group_vals else None; st.info(f"Showing: **{group_dim}** = {focus_group}") if focus_group else None
-    if not focus_group: st.warning("No product group found."); return
+    if len(group_vals) > 1:
+        focus_group = st.selectbox(f"Select {group_dim} to explore", group_vals, key="pr_focus_group")
+    elif group_vals:
+        focus_group = group_vals[0]
+        st.info(f"Auto-selected: **{group_dim}** = {focus_group}")
+    else:
+        st.warning("No product group found."); return
 
     df_grp = df_base[df_base[group_dim] == focus_group]
     ap_grp = annual_price_df[annual_price_df[group_dim] == focus_group] if not annual_price_df.empty else pd.DataFrame()
@@ -613,13 +627,15 @@ def render_price_tab(df_curr: pd.DataFrame, fmap: dict):
     crc_in_group = sorted(df_grp["Comm Ref Code"].replace("", pd.NA).dropna().unique().tolist())
     cr_in_group  = sorted(df_grp["Commercial Reference"].replace("", pd.NA).dropna().unique().tolist())
 
+    # ── Section 3: Family / SPF Level ────────────────────────────────────────
     section(f"📦 {group_dim} Level — {focus_group}")
     if not ap_grp.empty:
         grp_annual = ap_grp.groupby(["Year","Country"], as_index=False).agg(Value=("Value (EUR)", "sum"), Qty=("Total Qty", "sum"))
         grp_annual = grp_annual[grp_annual["Qty"] > 0].copy()
         grp_annual["Unit Price (EUR)"] = grp_annual["Value"] / grp_annual["Qty"]
         grp_annual.rename(columns={"Qty":"Total Qty","Value":"Value (EUR)"}, inplace=True)
-        show2(price_trend_chart(grp_annual.sort_values(["Country","Year"]), "Year", "Country", f"{focus_group} — Avg Unit Price by Year & Country"), qty_trend_chart(grp_annual.sort_values(["Country","Year"]), "Year", "Country", f"{focus_group} — Total Volume by Year & Country"))
+        show2(price_trend_chart(grp_annual.sort_values(["Country","Year"]), "Year", "Country", f"{focus_group} — Avg Unit Price by Year & Country"),
+              qty_trend_chart(grp_annual.sort_values(["Country","Year"]), "Year", "Country", f"{focus_group} — Total Volume by Year & Country"))
         yoy = _yoy_pct(grp_annual, "Year")
         if not yoy.empty: st.plotly_chart(pct_chart(yoy, "Year", "YoY %", "Country", f"{focus_group} — YoY Price Change %"), use_container_width=True)
 
@@ -628,75 +644,153 @@ def render_price_tab(df_curr: pd.DataFrame, fmap: dict):
         grp_monthly = grp_monthly[grp_monthly["Qty"] > 0].copy()
         grp_monthly["Unit Price (EUR)"] = grp_monthly["Value"] / grp_monthly["Qty"]
         grp_monthly.rename(columns={"Qty":"Total Qty","Value":"Value (EUR)"}, inplace=True)
-        show2(price_trend_chart(grp_monthly.sort_values("YM"), "YM", "Country", f"{focus_group} — Monthly Avg Price"), pct_chart(_mom_pct(grp_monthly), "YM", "MoM %", "Country", f"{focus_group} — MoM Price Change %"))
+        show2(price_trend_chart(grp_monthly.sort_values("YM"), "YM", "Country", f"{focus_group} — Monthly Avg Price"),
+              pct_chart(_mom_pct(grp_monthly), "YM", "MoM %", "Country", f"{focus_group} — MoM Price Change %"))
 
+    # ── Section 4: Comm Ref Code Level ───────────────────────────────────────
     if crc_in_group:
         section(f"🔖 Comm Ref Code Level — within {focus_group}")
         s4c1, s4c2, s4c3 = st.columns(3)
         with s4c1:
             all_countries_grp = sorted(df_grp["Country"].replace("", pd.NA).dropna().unique().tolist())
-            sel_s4_country = st.multiselect("Country", all_countries_grp, default=all_countries_grp[:5] if len(all_countries_grp)>5 else all_countries_grp, key="pr_s4_country")
-        with s4c2: s4_period = st.radio("Period", ["Year", "Month"], horizontal=True, key="pr_s4_period")
+            sel_s4_country = st.multiselect("Country", all_countries_grp,
+                default=all_countries_grp[:5] if len(all_countries_grp) > 5 else all_countries_grp,
+                key="pr_s4_country")
+        with s4c2:
+            s4_period = st.radio("Period", ["Year", "Month"], horizontal=True, key="pr_s4_period")
         with s4c3:
             if s4_period == "Year":
                 all_years_grp = sorted(df_grp["Year"].replace("", pd.NA).dropna().unique().tolist())
-                sel_s4_periods = st.multiselect("Select Years", all_years_grp, default=all_years_grp, key="pr_s4_years")
+                sel_s4_years = st.multiselect("Years to compare", all_years_grp, default=all_years_grp, key="pr_s4_years")
+                sel_s4_periods = sel_s4_years
             else:
                 all_ym = sorted(mp_grp["YM"].unique().tolist()) if not mp_grp.empty else []
-                sel_s4_periods = st.multiselect("Select Year-Months", all_ym, default=all_ym[-12:] if len(all_ym)>=12 else all_ym, key="pr_s4_ym")
+                sel_s4_periods = st.multiselect("Select Year-Months", all_ym,
+                    default=all_ym[-12:] if len(all_ym) >= 12 else all_ym, key="pr_s4_ym")
+                sel_s4_years = sorted({ym[:4] for ym in sel_s4_periods}) if sel_s4_periods else []
 
-        def _s4_make_chart(df_src, period_col, grp_keys):
-            agg = df_src.groupby(grp_keys + ["Country"], as_index=False).agg(Value=("Value (EUR)", "sum"), Qty=("Total Qty", "sum"))
+        period_col = "Year" if s4_period == "Year" else "YM"
+        src = ap_grp if s4_period == "Year" else mp_grp
+        s4_agg = pd.DataFrame()
+        if not src.empty:
+            s4_src = src.copy()
+            if sel_s4_country:  s4_src = s4_src[s4_src["Country"].isin(sel_s4_country)]
+            if sel_s4_periods:  s4_src = s4_src[s4_src[period_col].isin(sel_s4_periods)]
+            agg = s4_src.groupby(["Comm Ref Code", period_col, "Country"], as_index=False).agg(
+                Value=("Value (EUR)", "sum"), Qty=("Total Qty", "sum"))
             agg = agg[agg["Qty"] > 0].copy()
             agg["Unit Price (EUR)"] = agg["Value"] / agg["Qty"]
             agg["Total Qty"] = agg["Qty"]
-            return agg
-
-        period_col = "Year" if s4_period == "Year" else "YM"
-        src = ap_grp.copy() if s4_period == "Year" else mp_grp.copy()
-        s4_agg = pd.DataFrame()
-        if not src.empty:
-            if sel_s4_country: src = src[src["Country"].isin(sel_s4_country)]
-            if sel_s4_periods: src = src[src[period_col].isin(sel_s4_periods)]
-            s4_agg = _s4_make_chart(src, period_col, ["Comm Ref Code", period_col])
+            s4_agg = agg
 
         if not s4_agg.empty:
-            ctry_label = ", ".join(sel_s4_country) if sel_s4_country else "All Countries"
             periods_selected = sorted(s4_agg[period_col].unique().tolist())
-            if len(periods_selected) > 1: sel_snap = st.select_slider(f"Snapshot {period_col}", options=periods_selected, value=periods_selected[-1], key="pr_s4_snap")
-            else: sel_snap = periods_selected[0]
-            snap_df = s4_agg[s4_agg[period_col] == sel_snap].sort_values("Comm Ref Code")
+            ctry_label = ", ".join(sel_s4_country) if sel_s4_country else "All Countries"
 
-            fig_snap_price = px.bar(snap_df, x="Comm Ref Code", y="Unit Price (EUR)", color="Country", barmode="group", title=f"Avg Unit Price by Model — {focus_group} | {sel_snap}", color_discrete_sequence=CHART_COLORS, text_auto=".2s")
-            fig_snap_price.update_layout(height=440, font=dict(family="IBM Plex Sans"), title_font=dict(size=13, color="#1F3864"), legend=dict(orientation="h", y=-0.35), bargap=0.15)
-            st.plotly_chart(fig_snap_price, use_container_width=True)
+            # ── Avg Unit Price: X=CRC, colour=Country×Year (same country=same hue, different year=different shade)
+            st.markdown(f"**📊 Avg Unit Price by Model — All Selected {period_col}s | {ctry_label}**")
+            st.caption("Same country = same colour family; different years = light→dark shading.")
 
-            fig_snap_qty = px.bar(snap_df, x="Comm Ref Code", y="Total Qty", color="Country", barmode="group", title=f"Sales Volume by Model — {focus_group} | {sel_snap}", color_discrete_sequence=CHART_COLORS)
-            fig_snap_qty.update_layout(height=400, font=dict(family="IBM Plex Sans"), title_font=dict(size=13, color="#1F3864"), legend=dict(orientation="h", y=-0.35))
-            st.plotly_chart(fig_snap_qty, use_container_width=True)
+            # Build colour map: country→base colour, year→shade
+            all_ctries = sorted(s4_agg["Country"].unique().tolist())
+            n_ctry = len(all_ctries)
+            base_palette = CHART_COLORS * ((n_ctry // len(CHART_COLORS)) + 1)
+            ctry_base = {c: base_palette[i] for i, c in enumerate(all_ctries)}
 
+            def _shade(hex_color: str, factor: float) -> str:
+                """Lighten (factor<1) or darken (factor>1) a hex colour."""
+                h = hex_color.lstrip("#")
+                r, g, b = int(h[0:2],16), int(h[2:4],16), int(h[4:6],16)
+                r = int(min(255, r * factor)); g = int(min(255, g * factor)); b = int(min(255, b * factor))
+                return f"#{r:02x}{g:02x}{b:02x}"
+
+            n_years = len(periods_selected) if s4_period == "Year" else max(1, len({ym[:4] for ym in periods_selected}))
+            shade_factors = [0.55 + 0.45 * i / max(n_years - 1, 1) for i in range(n_years)]  # light→dark
+            period_keys = periods_selected if s4_period == "Year" else sorted({ym[:4] for ym in periods_selected})
+            year_shade  = {yr: shade_factors[i] for i, yr in enumerate(period_keys)}
+
+            # Build series label and colour map
+            s4_agg["yr_key"] = s4_agg[period_col].apply(lambda x: x[:4] if s4_period != "Year" else x)
+            s4_agg["Series"] = s4_agg["Country"] + " (" + s4_agg[period_col] + ")"
+            color_map_s4 = {}
+            for _, row in s4_agg.iterrows():
+                base_c = ctry_base.get(row["Country"], "#2E75B6")
+                shade  = year_shade.get(row["yr_key"], 0.7)
+                color_map_s4[row["Series"]] = _shade(base_c, shade)
+
+            fig_multi_price = px.bar(
+                s4_agg.sort_values(["Comm Ref Code", "Country", period_col]),
+                x="Comm Ref Code", y="Unit Price (EUR)", color="Series",
+                barmode="group",
+                title=f"Avg Unit Price by Model — {focus_group} | {ctry_label} | {', '.join(periods_selected[:5])}{'…' if len(periods_selected)>5 else ''}",
+                color_discrete_map=color_map_s4, text_auto=".2s",
+            )
+            fig_multi_price.update_xaxes(tickangle=-35, title="Comm Ref Code (Model)")
+            fig_multi_price.update_yaxes(title="Avg Unit Price (EUR)")
+            fig_multi_price.update_layout(height=460, font=dict(family="IBM Plex Sans"),
+                title_font=dict(size=13, color="#1F3864"), legend=dict(orientation="h", y=-0.35), bargap=0.12)
+            st.plotly_chart(fig_multi_price, use_container_width=True)
+
+            # Volume chart
+            fig_multi_qty = px.bar(
+                s4_agg.sort_values(["Comm Ref Code", "Country", period_col]),
+                x="Comm Ref Code", y="Total Qty", color="Series",
+                barmode="group", title=f"Sales Volume by Model — {focus_group} | {ctry_label}",
+                color_discrete_map=color_map_s4,
+            )
+            fig_multi_qty.update_xaxes(tickangle=-35); fig_multi_qty.update_yaxes(title="Volume (Qty)")
+            fig_multi_qty.update_layout(height=400, font=dict(family="IBM Plex Sans"),
+                title_font=dict(size=13, color="#1F3864"), legend=dict(orientation="h", y=-0.35))
+            st.plotly_chart(fig_multi_qty, use_container_width=True)
+
+            # ── Price Trend Over Time — all models, multiselect connected to s4_agg
             if len(periods_selected) > 1:
                 st.markdown("**📈 Price Trend Over Time — per Model**")
-                all_models = sorted(s4_agg["Comm Ref Code"].unique().tolist())
-                sel_trend_models = st.multiselect("Select models for trend chart", all_models, key="pr_s4_trend_models")
-                trend_df = s4_agg.copy()
-                if sel_trend_models: trend_df = trend_df[trend_df["Comm Ref Code"].isin(sel_trend_models)]
-                models_to_plot = sorted(trend_df["Comm Ref Code"].unique().tolist())
-                if len(models_to_plot) <= 4:
-                    for model in models_to_plot:
-                        mdf = trend_df[trend_df["Comm Ref Code"] == model].sort_values([period_col, "Country"])
-                        c_l, c_r = st.columns(2)
-                        with c_l:
-                            fig_tr = px.line(mdf, x=period_col, y="Unit Price (EUR)", color="Country", markers=True, title=f"{model} — Price Trend", color_discrete_sequence=CHART_COLORS)
-                            fig_tr.update_layout(height=320, font=dict(family="IBM Plex Sans"), title_font=dict(size=12, color="#1F3864"), legend=dict(orientation="h", y=-0.4)); st.plotly_chart(fig_tr, use_container_width=True)
-                        with c_r:
-                            fig_qr = px.bar(mdf, x=period_col, y="Total Qty", color="Country", barmode="group", title=f"{model} — Volume Trend", color_discrete_sequence=CHART_COLORS)
-                            fig_qr.update_layout(height=320, font=dict(family="IBM Plex Sans"), title_font=dict(size=12, color="#1F3864"), legend=dict(orientation="h", y=-0.4)); st.plotly_chart(fig_qr, use_container_width=True)
-                else:
-                    trend_df["Label"] = trend_df["Comm Ref Code"] + " | " + trend_df["Country"]
-                    fig_all = px.line(trend_df.sort_values([period_col, "Label"]), x=period_col, y="Unit Price (EUR)", color="Label", markers=True, title="Price Trend — all selected models", color_discrete_sequence=CHART_COLORS)
-                    fig_all.update_layout(height=420, font=dict(family="IBM Plex Sans"), title_font=dict(size=13, color="#1F3864"), legend=dict(orientation="h", y=-0.4)); st.plotly_chart(fig_all, use_container_width=True)
+                all_models_s4 = sorted(s4_agg["Comm Ref Code"].unique().tolist())
+                # Default: if CR filter active, pre-select matching CRCs
+                default_models = []
+                if cr_selected:
+                    cr_crcs = sorted(df_base[df_base["Commercial Reference"].isin(cr_selected)]["Comm Ref Code"].unique().tolist())
+                    default_models = [m for m in cr_crcs if m in all_models_s4]
+                if not default_models:
+                    default_models = all_models_s4[:min(4, len(all_models_s4))]
 
+                sel_trend_models = st.multiselect(
+                    "Select models for trend chart (leave empty = all)",
+                    all_models_s4, default=default_models, key="pr_s4_trend_models"
+                )
+                trend_df = s4_agg[s4_agg["Comm Ref Code"].isin(sel_trend_models)] if sel_trend_models else s4_agg
+                models_to_plot = sorted(trend_df["Comm Ref Code"].unique().tolist())
+
+                if models_to_plot:
+                    if len(models_to_plot) <= 4:
+                        for model in models_to_plot:
+                            mdf = trend_df[trend_df["Comm Ref Code"] == model].sort_values([period_col, "Country"])
+                            c_l, c_r = st.columns(2)
+                            with c_l:
+                                fig_tr = px.line(mdf, x=period_col, y="Unit Price (EUR)", color="Country",
+                                    markers=True, title=f"{model} — Price Trend", color_discrete_sequence=CHART_COLORS)
+                                fig_tr.update_layout(height=320, font=dict(family="IBM Plex Sans"),
+                                    title_font=dict(size=12, color="#1F3864"), legend=dict(orientation="h", y=-0.4))
+                                st.plotly_chart(fig_tr, use_container_width=True)
+                            with c_r:
+                                fig_qr = px.bar(mdf, x=period_col, y="Total Qty", color="Country",
+                                    barmode="group", title=f"{model} — Volume Trend", color_discrete_sequence=CHART_COLORS)
+                                fig_qr.update_layout(height=320, font=dict(family="IBM Plex Sans"),
+                                    title_font=dict(size=12, color="#1F3864"), legend=dict(orientation="h", y=-0.4))
+                                st.plotly_chart(fig_qr, use_container_width=True)
+                    else:
+                        trend_df = trend_df.copy()
+                        trend_df["Label"] = trend_df["Comm Ref Code"] + " | " + trend_df["Country"]
+                        fig_all = px.line(trend_df.sort_values([period_col, "Label"]),
+                            x=period_col, y="Unit Price (EUR)", color="Label",
+                            markers=True, title="Price Trend — selected models",
+                            color_discrete_sequence=CHART_COLORS)
+                        fig_all.update_layout(height=420, font=dict(family="IBM Plex Sans"),
+                            title_font=dict(size=13, color="#1F3864"), legend=dict(orientation="h", y=-0.4))
+                        st.plotly_chart(fig_all, use_container_width=True)
+
+            # YoY / MoM % change
             yoy_rows = []
             for (model, cty), grp in s4_agg.groupby(["Comm Ref Code","Country"]):
                 grp = grp.sort_values(period_col).copy()
@@ -704,13 +798,15 @@ def render_price_tab(df_curr: pd.DataFrame, fmap: dict):
                 yoy_rows.append(grp)
             df_chg = pd.concat(yoy_rows).dropna(subset=["Chg %"]) if yoy_rows else pd.DataFrame()
             chg_label = "YoY" if s4_period == "Year" else "MoM"
-
             if not df_chg.empty:
-                df_chg_snap = df_chg[df_chg[period_col] == sel_snap] if len(periods_selected) > 1 else df_chg
-                if not df_chg_snap.empty:
-                    fig_chg = px.bar(df_chg_snap.sort_values("Comm Ref Code"), x="Comm Ref Code", y="Chg %", color="Country", barmode="group", title=f"{chg_label} Price Change % by Model", color_discrete_sequence=CHART_COLORS)
-                    fig_chg.add_hline(y=0, line_dash="dash", line_color="gray", line_width=1)
-                    fig_chg.update_layout(height=340, font=dict(family="IBM Plex Sans"), title_font=dict(size=13, color="#1F3864"), legend=dict(orientation="h", y=-0.35)); st.plotly_chart(fig_chg, use_container_width=True)
+                fig_chg = px.bar(df_chg.sort_values("Comm Ref Code"), x="Comm Ref Code", y="Chg %",
+                    color="Series", barmode="group",
+                    title=f"{chg_label} Price Change % by Model",
+                    color_discrete_map=color_map_s4)
+                fig_chg.add_hline(y=0, line_dash="dash", line_color="gray", line_width=1)
+                fig_chg.update_layout(height=340, font=dict(family="IBM Plex Sans"),
+                    title_font=dict(size=13, color="#1F3864"), legend=dict(orientation="h", y=-0.35))
+                st.plotly_chart(fig_chg, use_container_width=True)
 
     if has_cr_filter:
         cr_to_detail = [c for c in pc["cr"] if c in cr_in_group] or pc["cr"]
